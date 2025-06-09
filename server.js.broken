@@ -1,0 +1,5634 @@
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const path = require('path');
+
+const Database = require('./database');
+const MigrationService = require('./migrationService');
+const config = require('./config');
+
+const app = express();
+const port = config.app.port;
+
+// Initialize database and migration service
+let db;
+let migrationService;
+
+// Middleware
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: [
+        "'self'",
+        "'unsafe-inline'",
+        "'unsafe-hashes'",
+        "https://cdn.jsdelivr.net",
+        "https://cdnjs.cloudflare.com"
+      ],
+      scriptSrcAttr: ["'unsafe-inline'", "'unsafe-hashes'"],
+      styleSrc: [
+        "'self'",
+        "'unsafe-inline'",
+        "https://cdn.jsdelivr.net",
+        "https://cdnjs.cloudflare.com"
+      ],
+      fontSrc: [
+        "'self'",
+        "https://cdn.jsdelivr.net"
+      ],
+      imgSrc: ["'self'", "data:"],
+    },
+  },
+}));
+app.use(cors());
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+// Serve static files from public directory
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+  res.json({ 
+    status: 'healthy', 
+    timestamp: new Date().toISOString(),
+    version: '1.0.0'
+  });
+});
+
+// Setup wizard endpoints
+app.get('/api/setup/status', async (req, res) => {
+  try {
+    const isConfigured = await db.isServiceConfigured();
+    res.json({ isConfigured });
+  } catch (error) {
+    console.error('Error checking setup status:', error);
+    res.status(500).json({ error: 'Failed to check setup status' });
+  }
+});
+
+app.post('/api/setup/test-source', async (req, res) => {
+  try {
+    const { url, apiKey, name, tenant, lorawanVersion } = req.body;
+    
+    console.log('Test-source request received:', { url, apiKey: apiKey ? 'PRESENT' : 'MISSING', name, tenant, lorawanVersion });
+    
+    if (!url) {
+      return res.json({ 
+        success: false, 
+        error: 'URL is required' 
+      });
+    }
+    
+    // Create temporary ChirpStack client for testing
+    const tempClient = {
+      name: name || 'Source LNS',
+      url: url,
+      apiKey: apiKey,
+      tenant: tenant || 'ChirpStack',
+      isHeliumChirpStack: false
+    };
+    
+    // Test connection by trying to list applications
+    const ChirpStackClient = require('./chirpstackClient');
+    const testClient = new ChirpStackClient(tempClient);
+    
+    const applications = await testClient.listApplications();
+    
+    res.json({ 
+      success: true, 
+      applications: applications.length,
+      message: 'Connection successful'
+    });
+  } catch (error) {
+    console.error('Source LNS test failed:', error);
+    res.json({ 
+      success: false, 
+      error: error.message || 'Connection failed'
+    });
+  }
+});
+
+app.post('/api/setup/test-target', async (req, res) => {
+  try {
+    const { url, apiKey, name, tenant, type } = req.body;
+    
+    console.log('Test-target request received:', { url, apiKey: apiKey ? 'PRESENT' : 'MISSING', name, tenant, type });
+    
+    if (!url) {
+      return res.json({ 
+        success: false, 
+        error: 'URL is required' 
+      });
+    }
+    
+    // Create temporary ChirpStack client for testing
+    const tempClient = {
+      name: name || 'Target LNS',
+      url: url,
+      apiKey: apiKey,
+      tenant: tenant || 'buoy',
+      isHeliumChirpStack: type === 'helium'
+    };
+    
+    // Test connection by trying to list applications
+    const ChirpStackClient = require('./chirpstackClient');
+    const testClient = new ChirpStackClient(tempClient);
+    
+    const applications = await testClient.listApplications();
+    const deviceProfiles = await testClient.listDeviceProfiles();
+    
+    res.json({ 
+      success: true, 
+      applications: applications.length,
+      deviceProfiles: deviceProfiles.length,
+      message: 'Connection successful'
+    });
+  } catch (error) {
+    console.error('Target LNS test failed:', error);
+    res.json({ 
+      success: false, 
+      error: error.message || 'Connection failed'
+    });
+  }
+});
+
+app.post('/api/setup/complete', async (req, res) => {
+  try {
+    const { sourceLNS, targetLNS } = req.body;
+    
+    // Save configuration to database
+    await db.saveConfig('sourceLNS', sourceLNS, 'Source ChirpStack LNS configuration');
+    await db.saveConfig('targetLNS', targetLNS, 'Target ChirpStack LNS configuration');
+    
+    console.log('Setup completed successfully');
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error completing setup:', error);
+    res.status(500).json({ error: 'Failed to save configuration' });
+  }
+});
+
+// Test LNS connections
+app.get('/api/connections/test', async (req, res) => {
+  try {
+    const results = await migrationService.testConnections();
+    res.json(results);
+  } catch (error) {
+    console.error('Error testing connections:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Device discovery and sync
+app.post('/api/devices/discover', async (req, res) => {
+  try {
+    console.log('Starting device discovery...');
+    const results = await migrationService.discoverDevices();
+    res.json(results);
+  } catch (error) {
+    console.error('Error during device discovery:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get all devices from local database
+app.get('/api/devices', async (req, res) => {
+  try {
+    const devices = await db.getAllDevices();
+    res.json(devices);
+  } catch (error) {
+    console.error('Error fetching devices:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get specific device details
+app.get('/api/devices/:devEUI', async (req, res) => {
+  try {
+    const { devEUI } = req.params;
+    const device = await db.getDevice(devEUI);
+    
+    if (!device) {
+      return res.status(404).json({ error: 'Device not found' });
+    }
+
+    // Also get session keys and migration history
+    const [sessionKeys, migrationHistory] = await Promise.all([
+      db.getSessionKeys(devEUI),
+      db.getMigrationHistory(devEUI)
+    ]);
+
+    res.json({
+      device,
+      sessionKeys,
+      migrationHistory
+    });
+  } catch (error) {
+    console.error('Error fetching device details:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+// Migrate single device
+app.post('/api/devices/:devEUI/migrate', async (req, res) => {
+  try {
+    const { devEUI } = req.params;
+    const options = req.body;
+
+    console.log(`Received migration request for ${devEUI} with options:`, options);
+
+    const result = await migrationService.migrateDevice(devEUI, options);
+    res.json(result);
+  } catch (error) {
+    console.error('Error migrating device:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Migrate multiple devices
+app.post('/api/devices/migrate/batch', async (req, res) => {
+  try {
+    const { devEUIs, options } = req.body;
+
+    if (!devEUIs || !Array.isArray(devEUIs) || devEUIs.length === 0) {
+      return res.status(400).json({ error: 'devEUIs array is required' });
+    }
+
+    console.log(`Received batch migration request for ${devEUIs.length} devices`);
+
+    const results = await migrationService.migrateDevices(devEUIs, options || {});
+    res.json(results);
+  } catch (error) {
+    console.error('Error during batch migration:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get migration history
+app.get('/api/migrations', async (req, res) => {
+  try {
+    const { devEUI } = req.query;
+    const history = await migrationService.getMigrationHistory(devEUI);
+    res.json(history);
+  } catch (error) {
+    console.error('Error fetching migration history:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get available applications from both LNS systems
+app.get('/api/applications', async (req, res) => {
+  try {
+    const applications = await migrationService.getAvailableApplications();
+    res.json(applications);
+  } catch (error) {
+    console.error('Error fetching applications:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get devices for a specific application from old LNS
+app.get('/api/applications/:applicationId/devices', async (req, res) => {
+  try {
+    const { applicationId } = req.params;
+    const devices = await migrationService.getApplicationDevices(applicationId);
+    res.json(devices);
+  } catch (error) {
+    console.error('Error fetching application devices:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Migrate all devices in an application  
+app.post('/api/applications/:applicationId/migrate', async (req, res) => {
+  try {
+    const { applicationId } = req.params;
+    const options = req.body;
+
+    console.log(`Received application migration request for ${applicationId}`);
+
+    const devices = await migrationService.getApplicationDevices(applicationId);
+    const devEUIs = devices.map(device => device.devEUI);
+    
+    if (devEUIs.length === 0) {
+      return res.json({ 
+        success: true, 
+        message: 'No devices found in application',
+        results: []
+      });
+    }
+
+    const results = await migrationService.migrateDevices(devEUIs, options || {});
+    res.json(results);
+  } catch (error) {
+    console.error('Error during application migration:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get available device profiles from both LNS systems
+app.get('/api/device-profiles', async (req, res) => {
+  try {
+    const deviceProfiles = await migrationService.getAvailableDeviceProfiles();
+    res.json(deviceProfiles);
+  } catch (error) {
+    console.error('Error fetching device profiles:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Test AppKey extraction for a specific device
+app.get('/api/devices/:devEUI/test-appkey', async (req, res) => {
+  try {
+    const { devEUI } = req.params;
+    const result = await migrationService.testAppKeyExtraction(devEUI);
+    res.json(result);
+  } catch (error) {
+    console.error('Error testing AppKey extraction:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get basic statistics
+app.get('/api/stats', async (req, res) => {
+  try {
+    const stats = await migrationService.getStatistics();
+    res.json(stats);
+  } catch (error) {
+    console.error('Error fetching statistics:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+  res.json({ 
+    status: 'OK', 
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime()
+  });
+});
+
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database first
+    db = require('./database');
+    await db.init();
+    console.log('Database initialized');
+
+    // Check if service is configured
+    const isConfigured = await db.isServiceConfigured();
+    
+    let runtimeConfig;
+    if (isConfigured) {
+      console.log('Loading configuration from database...');
+      runtimeConfig = {
+        oldLNS: await db.getConfig('sourceLNS'),
+        newLNS: await db.getConfig('targetLNS')
+      };
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+      runtimeConfig = config;
+    }
+    
+    // Initialize migration service with runtime config
+    const MigrationService = require('./migrationService');
+    migrationService = new MigrationService(runtimeConfig);
+    await migrationService.init();
+    console.log('Migration service initialized');
+
+    // Start server
+    app.listen(PORT, () => {
+      console.log('');
+      console.log(`🚀 keyManager service running on port ${PORT}`);
+      console.log(`📊 Web interface: http://localhost:${PORT}`);
+      console.log(`🔗 API base URL: http://localhost:${PORT}/api`);
+      console.log('');
+      console.log('Available endpoints:');
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+app.post('/api/setup/test-target', async (req, res) => {
+  try {
+    const { url, apiKey, name, tenant, type } = req.body;
+    
+    // Create temporary ChirpStack client for testing
+    const tempClient = {
+      name: name || 'Target LNS',
+      url: url,
+      apiKey: apiKey,
+      tenant: tenant || 'buoy',
+      isHeliumChirpStack: type === 'helium'
+    };
+    
+    // Test connection by trying to list applications
+    const ChirpStackClient = require('./chirpstackClient');
+    const testClient = new ChirpStackClient(tempClient);
+    
+    const applications = await testClient.listApplications();
+    const deviceProfiles = await testClient.listDeviceProfiles();
+    
+    res.json({ 
+      success: true, 
+      applications: applications.length,
+      deviceProfiles: deviceProfiles.length,
+      message: 'Connection successful'
+    });
+  } catch (error) {
+    console.error('Target LNS test failed:', error);
+    res.json({ 
+      success: false, 
+      error: error.message || 'Connection failed'
+    });
+  }
+});
+
+app.post('/api/setup/complete', async (req, res) => {
+  try {
+    const { sourceLNS, targetLNS } = req.body;
+    
+    // Save configuration to database
+    await db.saveConfig('sourceLNS', sourceLNS, 'Source ChirpStack LNS configuration');
+    await db.saveConfig('targetLNS', targetLNS, 'Target ChirpStack LNS configuration');
+    
+    console.log('Setup completed successfully');
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error completing setup:', error);
+    res.status(500).json({ error: 'Failed to save configuration' });
+  }
+});
+
+// Test LNS connections
+app.get('/api/connections/test', async (req, res) => {
+  try {
+    const results = await migrationService.testConnections();
+    res.json(results);
+  } catch (error) {
+    console.error('Error testing connections:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Device discovery and sync
+app.post('/api/devices/discover', async (req, res) => {
+  try {
+    console.log('Starting device discovery...');
+    const results = await migrationService.discoverDevices();
+    res.json(results);
+  } catch (error) {
+    console.error('Error during device discovery:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get all devices from local database
+app.get('/api/devices', async (req, res) => {
+  try {
+    const devices = await db.getAllDevices();
+    res.json(devices);
+  } catch (error) {
+    console.error('Error fetching devices:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get specific device details
+app.get('/api/devices/:devEUI', async (req, res) => {
+  try {
+    const { devEUI } = req.params;
+    const device = await db.getDevice(devEUI);
+    
+    if (!device) {
+      return res.status(404).json({ error: 'Device not found' });
+    }
+
+    // Also get session keys and migration history
+    const [sessionKeys, migrationHistory] = await Promise.all([
+      db.getSessionKeys(devEUI),
+      db.getMigrationHistory(devEUI)
+    ]);
+
+    res.json({
+      device,
+      sessionKeys,
+      migrationHistory
+    });
+  } catch (error) {
+    console.error('Error fetching device details:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+// Migrate single device
+app.post('/api/devices/:devEUI/migrate', async (req, res) => {
+  try {
+    const { devEUI } = req.params;
+    const options = req.body;
+
+    console.log(`Received migration request for ${devEUI} with options:`, options);
+
+    const result = await migrationService.migrateDevice(devEUI, options);
+    res.json(result);
+  } catch (error) {
+    console.error('Error migrating device:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Migrate multiple devices
+app.post('/api/devices/migrate/batch', async (req, res) => {
+  try {
+    const { devEUIs, options } = req.body;
+
+    if (!devEUIs || !Array.isArray(devEUIs) || devEUIs.length === 0) {
+      return res.status(400).json({ error: 'devEUIs array is required' });
+    }
+
+    console.log(`Received batch migration request for ${devEUIs.length} devices`);
+
+    const results = await migrationService.migrateDevices(devEUIs, options || {});
+    res.json(results);
+  } catch (error) {
+    console.error('Error during batch migration:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get migration history
+app.get('/api/migrations', async (req, res) => {
+  try {
+    const { devEUI } = req.query;
+    const history = await migrationService.getMigrationHistory(devEUI);
+    res.json(history);
+  } catch (error) {
+    console.error('Error fetching migration history:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get available applications from both LNS systems
+app.get('/api/applications', async (req, res) => {
+  try {
+    const applications = await migrationService.getAvailableApplications();
+    res.json(applications);
+  } catch (error) {
+    console.error('Error fetching applications:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get devices for a specific application from old LNS
+app.get('/api/applications/:applicationId/devices', async (req, res) => {
+  try {
+    const { applicationId } = req.params;
+    const devices = await migrationService.getDevicesForApplication(applicationId);
+    res.json(devices);
+  } catch (error) {
+    console.error('Error fetching devices for application:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Migrate all devices from a source application to target application
+app.post('/api/applications/:applicationId/migrate', async (req, res) => {
+  try {
+    const { applicationId } = req.params;
+    const { targetApplicationId, targetDeviceProfileId, options = {} } = req.body;
+
+    if (!targetApplicationId || !targetDeviceProfileId) {
+      return res.status(400).json({ 
+        error: 'targetApplicationId and targetDeviceProfileId are required' 
+      });
+    }
+
+    console.log(`Received bulk migration request for application ${applicationId}`);
+    console.log(`Target: Application ${targetApplicationId}, Device Profile ${targetDeviceProfileId}`);
+
+    const result = await migrationService.migrateApplicationDevices(
+      applicationId, 
+      targetApplicationId, 
+      targetDeviceProfileId, 
+      options
+    );
+    res.json(result);
+  } catch (error) {
+    console.error('Error during application migration:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get available device profiles from both LNS systems
+app.get('/api/device-profiles', async (req, res) => {
+  try {
+    const profiles = await migrationService.getAvailableDeviceProfiles();
+    res.json(profiles);
+  } catch (error) {
+    console.error('Error fetching device profiles:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Statistics endpoint
+app.get('/api/stats', async (req, res) => {
+  try {
+    const [totalDevices, migrations] = await Promise.all([
+      db.all('SELECT COUNT(*) as count FROM devices'),
+      db.all(`
+        SELECT 
+          status,
+          COUNT(*) as count 
+        FROM migration_history 
+        GROUP BY status
+      `)
+    ]);
+
+    const migrationStats = migrations.reduce((acc, row) => {
+      acc[row.status] = row.count;
+      return acc;
+    }, {});
+
+    res.json({
+      totalDevices: totalDevices[0].count,
+      migrations: migrationStats,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Error fetching statistics:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Configuration endpoint
+app.get('/api/config', (req, res) => {
+  res.json({
+    oldLNS: {
+      name: config.oldLNS.name,
+      // Don't expose API keys in response
+    },
+    newLNS: {
+      name: config.newLNS.name,
+    },
+    migration: config.migration
+  });
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('Migration service initialized');
+
+    // Start server first - don't wait for connection tests
+    app.listen(port, () => {
+      console.log(`\n🚀 keyManager service running on port ${port}`);
+      console.log(`📊 Web interface: http://localhost:${port}`);
+      console.log(`🔗 API base URL: http://localhost:${port}/api`);
+      console.log(`\nAvailable endpoints:`);
+      console.log(`  GET  /api/health                    - Health check`);
+      console.log(`  GET  /api/connections/test          - Test LNS connections`);
+      console.log(`  POST /api/devices/discover          - Discover devices from old LNS`);
+      console.log(`  GET  /api/devices                   - List all devices`);
+      console.log(`  GET  /api/devices/:devEUI           - Get device details`);
+      console.log(`  GET  /api/devices/:devEUI/test-appkey - Test AppKey extraction`);
+      console.log(`  POST /api/devices/:devEUI/migrate   - Migrate single device`);
+      console.log(`  POST /api/devices/migrate/batch     - Migrate multiple devices`);
+      console.log(`  GET  /api/migrations                - Get migration history`);
+      console.log(`  GET  /api/applications              - Get available applications`);
+      console.log(`  GET  /api/applications/:id/devices  - Get devices for application`);
+      console.log(`  POST /api/applications/:id/migrate  - Migrate all devices in application`);
+      console.log(`  GET  /api/device-profiles           - Get available device profiles`);
+      console.log(`  GET  /api/stats                     - Get statistics`);
+      
+      // Test connections after server starts (don't block startup)
+      setTimeout(async () => {
+        try {
+          console.log('Testing LNS connections...');
+          await migrationService.testConnections();
+        } catch (error) {
+          console.error('Warning: Initial connection test failed:', error.message);
+        }
+      }, 1000);
+    });
+
+  } catch (error) {
+    console.error('Failed to initialize keyManager service:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down gracefully...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Shutting down keyManager service...');
+  if (db) {
+    await db.close();
+  }
+  process.exit(0);
+});
+
+// Start the application
+initialize().catch(error => {
+  console.error('Fatal error during initialization:', error);
+  process.exit(1);
+});
+
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Initialize and start server
+async function initialize() {
+  try {
+    console.log('Initializing keyManager service...');
+    
+    // Initialize database
+    db = new Database();
+    await db.initialize();
+    console.log('Database initialized');
+
+    // Check if service is configured via database
+    const isConfigured = await db.isServiceConfigured();
+    let runtimeConfig = config; // Default to config.js
+    
+    if (isConfigured) {
+      // Load configuration from database
+      const sourceLNS = await db.getConfig('sourceLNS');
+      const targetLNS = await db.getConfig('targetLNS');
+      
+      runtimeConfig = {
+        app: config.app, // Keep app config from config.js
+        oldLNS: {
+          name: sourceLNS.name,
+          url: sourceLNS.url,
+          apiKey: sourceLNS.apiKey,
+          tenant: sourceLNS.tenant,
+          lorawanVersion: sourceLNS.lorawanVersion
+        },
+        newLNS: {
+          name: targetLNS.name,
+          url: targetLNS.url,
+          apiKey: targetLNS.apiKey,
+          tenant: targetLNS.tenant,
+          isHeliumChirpStack: targetLNS.type === 'helium'
+        },
+        migration: config.migration // Keep migration defaults from config.js
+      };
+      
+      console.log('Using database configuration');
+    } else {
+      console.log('Using config.js configuration (setup wizard will be shown)');
+    }
+
+    // Initialize migration service with runtime configuration
+    migrationService = new MigrationService(db, runtimeConfig);
+    console.log('
