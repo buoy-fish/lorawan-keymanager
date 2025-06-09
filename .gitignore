@@ -38,6 +38,12 @@ Thumbs.db
 # Config files with sensitive data
 config.js
 
+# Development/private notes with sensitive data
+DEVME.md
+*.devme.md
+NOTES.md
+*.notes.md
+
 # Temporary files
 *.tmp
 *.temp
